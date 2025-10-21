@@ -1,365 +1,565 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
-import serial
-import serial.tools.list_ports
+# main.py
+from kivy.app import App
+from kivy.lang import Builder
+from kivy.clock import Clock, mainthread
+from kivy.properties import StringProperty, NumericProperty, BooleanProperty
+from kivy.uix.boxlayout import BoxLayout
+from kivy.animation import Animation
+from kivy.core.window import Window
+from kivy.utils import platform
+
+# Threading & parsing
 import threading
 import time
 
-BAUD_RATE = 9600  # Change to 38400 if your HC-05 uses that baud rate
+# Optional desktop serial support
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_PYSERIAL = True
+except Exception:
+    HAS_PYSERIAL = False
 
-class GestureVisualizer(tk.Canvas):
-    """Visual feedback for gestures with animated hand"""
-    def __init__(self, parent):
-        super().__init__(parent, height=250, bg='#1A1A2E', highlightthickness=0)
-        self.center_x = 300
-        self.center_y = 125
-        
-        # Create hand emoji that will move
-        self.hand_id = self.create_text(
-            self.center_x, self.center_y, text="✋", font=("Arial", 100), fill="#FFFFFF"
-        )
-        
-        # Gesture text below
-        self.gesture_text = self.create_text(
-            self.center_x, self.center_y + 90, text="Waiting for gesture...", 
-            font=("Arial", 18, "bold"), fill="#AAAAAA"
-        )
-        
-        # Position indicators
-        self.left_indicator = self.create_oval(30, 110, 60, 140, fill="#2196F3", outline="", state='hidden')
-        self.center_indicator = self.create_oval(285, 110, 315, 140, fill="#4CAF50", outline="", state='hidden')
-        self.right_indicator = self.create_oval(540, 110, 570, 140, fill="#FF6B9D", outline="", state='hidden')
-        
-        self.current_position = "CENTER"
-        self.animation_in_progress = False
-    
-    def show_gesture(self, gesture):
-        """Animate hand to gesture position"""
-        if self.animation_in_progress:
-            return
-        
-        gesture_config = {
-            "LEFT": {
-                "x": 100,
-                "emoji": "👈",
-                "color": "#2196F3",
-                "text": "◀️ LEFT DETECTED",
-                "indicator": self.left_indicator
-            },
-            "CENTER": {
-                "x": self.center_x,
-                "emoji": "✋",
-                "color": "#4CAF50",
-                "text": "✋ CENTER DETECTED",
-                "indicator": self.center_indicator
-            },
-            "RIGHT": {
-                "x": 500,
-                "emoji": "👉",
-                "color": "#FF6B9D",
-                "text": "▶️ RIGHT DETECTED",
-                "indicator": self.right_indicator
-            },
-            "NONE": {
-                "x": self.center_x,
-                "emoji": "🚫",
-                "color": "#9E9E9E",
-                "text": "⭕ NO GESTURE",
-                "indicator": self.center_indicator
-            }
-        }
-        
-        if gesture not in gesture_config:
-            return
-        
-        config = gesture_config[gesture]
-        
-        # Hide all indicators
-        self.itemconfig(self.left_indicator, state='hidden')
-        self.itemconfig(self.center_indicator, state='hidden')
-        self.itemconfig(self.right_indicator, state='hidden')
-        
-        # Show target indicator
-        self.itemconfig(config["indicator"], state='normal')
-        
-        # Animate hand movement
-        self.animate_to_position(config["x"], config["emoji"], config["color"], config["text"])
-        self.current_position = gesture
-    
-    def animate_to_position(self, target_x, emoji, color, text):
-        """Smooth animation to target position"""
-        self.animation_in_progress = True
-        current_coords = self.coords(self.hand_id)
-        current_x = current_coords[0]
-        
-        print(f"Animating from {current_x} to {target_x}")  # Debug
-        
-        # Calculate steps for smooth animation
-        steps = 20
-        dx = (target_x - current_x) / steps
-        
-        def move_step(step):
-            if step < steps:
-                self.move(self.hand_id, dx, 0)
-                self.after(15, lambda: move_step(step + 1))
-            else:
-                # Final position adjustment and update
-                self.coords(self.hand_id, target_x, self.center_y)
-                self.itemconfig(self.hand_id, text=emoji, fill=color)
-                self.itemconfig(self.gesture_text, text=text, fill=color)
-                
-                # Pulse effect
-                self.scale(self.hand_id, target_x, self.center_y, 1.2, 1.2)
-                self.after(150, lambda: self.scale(self.hand_id, target_x, self.center_y, 0.833, 0.833))
-                self.after(300, lambda: setattr(self, 'animation_in_progress', False))
-        
-        move_step(0)
+# Optional Android Bluetooth via pyjnius
+ANDROID_BLUETOOTH_AVAILABLE = False
+if platform == "android":
+    try:
+        from jnius import autoclass, cast
+        ANDROID_BLUETOOTH_AVAILABLE = True
+    except Exception:
+        ANDROID_BLUETOOTH_AVAILABLE = False
 
-class HC05App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("🎯 HC-05 Gesture Receiver")
-        self.root.geometry("600x780")
-        self.root.resizable(False, False)
-        self.root.configure(bg='#0F3460')
-        
+# --- KV UI ---
+KV = """
+<MainRoot>:
+    orientation: "vertical"
+    padding: dp(10)
+    spacing: dp(8)
+    canvas.before:
+        Color:
+            rgba: (0.06,0.13,0.38,1)  # dark blue background
+        Rectangle:
+            pos: self.pos
+            size: self.size
+
+    BoxLayout:
+        size_hint_y: None
+        height: dp(72)
+        spacing: dp(8)
+        Label:
+            text: "🎯 Gesture Detection System"
+            font_size: '22sp'
+            bold: True
+            color: (1,1,1,1)
+        Label:
+            text: root.conn_status
+            size_hint_x: None
+            width: dp(220)
+            color: root.conn_color
+
+    BoxLayout:
+        size_hint_y: None
+        height: dp(56)
+        spacing: dp(8)
+        Spinner:
+            id: port_spinner
+            text: root.port_text
+            values: root.port_list
+            size_hint_x: .6
+        Button:
+            text: "🔄 Refresh"
+            size_hint_x: .2
+            on_release: root.refresh_ports()
+        Button:
+            id: connect_btn
+            text: root.connect_text
+            size_hint_x: .2
+            on_release: root.toggle_connect()
+
+    FloatLayout:
+        size_hint_y: None
+        height: dp(300)
+        canvas.before:
+            Color:
+                rgba: (0.1,0.1,0.12,1)
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Label:
+            id: hand_label
+            text: root.hand_emoji
+            font_size: '120sp'
+            center_x: self.parent.center_x
+            center_y: self.parent.center_y + dp(20)
+            color: root.hand_color
+        Label:
+            id: gesture_text
+            text: root.gesture_text
+            font_size: '18sp'
+            size_hint: None, None
+            size: self.texture_size
+            center_x: self.parent.center_x
+            y: dp(10)
+            color: root.hand_color
+
+        # position indicators (left/center/right)
+        Label:
+            text: "◀"
+            font_size: '36sp'
+            center_x: self.parent.x + dp(60)
+            center_y: self.parent.center_y + dp(-40)
+            opacity: 1 if root.ind_left else .15
+        Label:
+            text: "●"
+            font_size: '28sp'
+            center_x: self.parent.center_x
+            center_y: self.parent.center_y + dp(-40)
+            color: (0.3,1,0.4,1) if root.ind_center else (1,1,1,0.15)
+        Label:
+            text: "▶"
+            font_size: '36sp'
+            center_x: self.parent.right - dp(60)
+            center_y: self.parent.center_y + dp(-40)
+            opacity: 1 if root.ind_right else .15
+
+    GridLayout:
+        cols: 2
+        row_default_height: dp(100)
+        row_force_default: True
+        spacing: dp(8)
+        BoxLayout:
+            orientation: "vertical"
+            canvas.before:
+                Color:
+                    rgba: (0.1,0.1,0.12,1)
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+            Label:
+                text: "👈 LEFT"
+                font_size: '20sp'
+            Label:
+                text: str(root.count_left)
+                font_size: '28sp'
+                color: (0.2,0.6,1,1)
+        BoxLayout:
+            orientation: "vertical"
+            canvas.before:
+                Color:
+                    rgba: (0.1,0.1,0.12,1)
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+            Label:
+                text: "👉 RIGHT"
+                font_size: '20sp'
+            Label:
+                text: str(root.count_right)
+                font_size: '28sp'
+                color: (1,0.4,0.6,1)
+        BoxLayout:
+            orientation: "vertical"
+            canvas.before:
+                Color:
+                    rgba: (0.1,0.1,0.12,1)
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+            Label:
+                text: "✋ CENTER"
+                font_size: '20sp'
+            Label:
+                text: str(root.count_center)
+                font_size: '28sp'
+                color: (0.2,1,0.4,1)
+        BoxLayout:
+            orientation: "vertical"
+            canvas.before:
+                Color:
+                    rgba: (0.1,0.1,0.12,1)
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+            Label:
+                text: "🚫 NONE"
+                font_size: '20sp'
+            Label:
+                text: str(root.count_none)
+                font_size: '28sp'
+                color: (0.6,0.6,0.6,1)
+
+    BoxLayout:
+        size_hint_y: None
+        height: dp(48)
+        spacing: dp(8)
+        Button:
+            text: "🔄 Reset Stats"
+            on_release: root.reset_stats()
+        Label:
+            text: "Last:"
+            size_hint_x: None
+            width: dp(50)
+            color: (1,1,1,0.7)
+        Label:
+            text: root.last_received
+            color: (1,1,1,0.9)
+
+    BoxLayout:
+        size_hint_y: None
+        height: dp(36)
+        spacing: dp(8)
+        Label:
+            text: "Mode:"
+            size_hint_x: None
+            width: dp(60)
+            color: (1,1,1,0.7)
+        Label:
+            text: root.mode_text
+            color: (1,1,1,0.9)
+"""
+
+# --- Backend Implementations ---
+class BluetoothBackendBase:
+    """Base interface - must implement connect(port), disconnect(), is_connected(), read_loop(callback)"""
+    def connect(self, port):
+        raise NotImplementedError()
+    def disconnect(self):
+        raise NotImplementedError()
+    def is_connected(self):
+        return False
+    def read_loop(self, callback):
+        """Start background read thread and call callback(line) on each received line."""
+        raise NotImplementedError()
+
+class SerialBackend(BluetoothBackendBase):
+    def __init__(self):
         self.ser = None
-        self.is_connected = False
-        self.gesture_count = {"LEFT": 0, "CENTER": 0, "RIGHT": 0, "NONE": 0}
-        self.total_gestures = 0
-        
-        self.setup_ui()
-    
-    def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#0F3460', padx=20, pady=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        title = tk.Label(main_frame, text="🎯 Gesture Detection System", font=("Arial", 24, "bold"),
-                         bg='#0F3460', fg='#FFFFFF')
-        title.pack(pady=(0, 5))
-        
-        subtitle = tk.Label(main_frame, text="Ultrasonic HC-05 Controller", 
-                           font=("Arial", 12), bg='#0F3460', fg='#AAAAAA')
-        subtitle.pack(pady=(0, 20))
-        
-        # --- CONNECTION ---
-        connection_frame = tk.Frame(main_frame, bg='#16213E', relief=tk.FLAT)
-        connection_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        # Status
-        status_container = tk.Frame(connection_frame, bg='#16213E', pady=15)
-        status_container.pack(fill=tk.X)
-        self.status_dot = tk.Canvas(status_container, width=20, height=20, bg='#16213E', highlightthickness=0)
-        self.status_dot.pack(side=tk.LEFT, padx=(20,10))
-        self.dot_id = self.status_dot.create_oval(2,2,18,18, fill='#F44336', outline='')
-        self.status_label = tk.Label(status_container, text="Not Connected", font=("Arial",14,"bold"),
-                                     bg='#16213E', fg='#F44336')
-        self.status_label.pack(side=tk.LEFT)
-        
-        # Port selection
-        port_frame = tk.Frame(connection_frame, bg='#16213E', pady=10)
-        port_frame.pack(fill=tk.X, padx=20)
-        tk.Label(port_frame, text="COM Port:", font=("Arial", 12), bg='#16213E', fg='#AAAAAA').pack(side=tk.LEFT, padx=(0,10))
-        ports = serial.tools.list_ports.comports()
-        self.com_var = tk.StringVar()
-        self.com_box = ttk.Combobox(port_frame, values=[p.device for p in ports], textvariable=self.com_var,
-                                    state="readonly", width=15, font=("Arial",11))
-        self.com_box.pack(side=tk.LEFT)
-        if ports: self.com_box.current(0)
-        tk.Button(port_frame, text="🔄", command=self.refresh_ports, bg='#2196F3', fg='white',
-                  font=("Arial",12), relief=tk.FLAT, padx=10, cursor='hand2').pack(side=tk.LEFT, padx=5)
-        
-        # Connect/Disconnect
-        btn_frame = tk.Frame(connection_frame, bg='#16213E', pady=15)
-        btn_frame.pack()
-        self.connect_btn = tk.Button(btn_frame, text="🔌 Connect", command=self.connect_hc05,
-                                     bg='#4CAF50', fg='white', font=("Arial",12,"bold"), relief=tk.FLAT, padx=20, pady=10,
-                                     cursor='hand2')
-        self.connect_btn.pack(side=tk.LEFT, padx=5)
-        self.disconnect_btn = tk.Button(btn_frame, text="⏸️ Disconnect", command=self.disconnect_hc05,
-                                        bg='#F44336', fg='white', font=("Arial",12,"bold"), relief=tk.FLAT, padx=20, pady=10,
-                                        state=tk.DISABLED, cursor='hand2')
-        self.disconnect_btn.pack(side=tk.LEFT, padx=5)
-        
-        # --- GESTURE VISUALIZER ---
-        viz_label = tk.Label(main_frame, text="📡 Live Hand Tracking", font=("Arial",16,"bold"), 
-                            bg='#0F3460', fg='#FFFFFF')
-        viz_label.pack(pady=(10,5))
-        self.visualizer = GestureVisualizer(main_frame)
-        self.visualizer.pack(fill=tk.X, pady=(0,15))
-        
-        # --- STATISTICS ---
-        stats_frame = tk.Frame(main_frame, bg='#16213E', pady=20)
-        stats_frame.pack(fill=tk.BOTH, expand=True, pady=(15,0))
-        
-        tk.Label(stats_frame, text="📊 Detection Statistics", font=("Arial",14,"bold"), 
-                bg='#16213E', fg='#FFFFFF').pack(pady=(0,15))
-        
-        # Gesture counts in grid
-        count_grid = tk.Frame(stats_frame, bg='#16213E')
-        count_grid.pack(pady=10)
-        
-        gestures = [
-            ("LEFT", "👈", "#2196F3"),
-            ("RIGHT", "👉", "#FF6B9D"),
-            ("CENTER", "✋", "#4CAF50"),
-            ("NONE", "🚫", "#9E9E9E")
-        ]
-        
-        self.count_labels = {}
-        for i, (name, emoji, color) in enumerate(gestures):
-            frame = tk.Frame(count_grid, bg='#1A1A2E', relief=tk.FLAT, padx=15, pady=10)
-            frame.grid(row=i//2, column=i%2, padx=10, pady=10, sticky='ew')
-            
-            tk.Label(frame, text=emoji, font=("Arial", 24), bg='#1A1A2E', fg='#FFFFFF').pack()
-            tk.Label(frame, text=name, font=("Arial", 10, "bold"), bg='#1A1A2E', fg='#AAAAAA').pack()
-            count_label = tk.Label(frame, text="0", font=("Arial", 20, "bold"), bg='#1A1A2E', fg=color)
-            count_label.pack()
-            self.count_labels[name] = count_label
-        
-        # Total counter
-        total_frame = tk.Frame(stats_frame, bg='#0F3460', pady=15, relief=tk.FLAT)
-        total_frame.pack(fill=tk.X, padx=20, pady=(15,10))
-        tk.Label(total_frame, text="Total Gestures Detected:", font=("Arial", 12), 
-                bg='#0F3460', fg='#AAAAAA').pack()
-        self.total_label = tk.Label(total_frame, text="0", font=("Arial", 28, "bold"), 
-                                    bg='#0F3460', fg='#4CAF50')
-        self.total_label.pack()
-        
-        # Last received
-        self.received_label = tk.Label(stats_frame, text="Waiting for data...", font=("Arial",11),
-                                       bg='#16213E', fg='#999999')
-        self.received_label.pack(pady=(10,0))
-        
-        # Reset button
-        reset_btn = tk.Button(stats_frame, text="🔄 Reset Statistics", command=self.reset_stats,
-                             bg='#FF9800', fg='white', font=("Arial",11,"bold"), relief=tk.FLAT, 
-                             padx=20, pady=8, cursor='hand2')
-        reset_btn.pack(pady=(10,0))
-    
-    def refresh_ports(self):
-        ports = serial.tools.list_ports.comports()
-        self.com_box['values'] = [p.device for p in ports]
-        if ports: self.com_box.current(0)
-        messagebox.showinfo("Ports Refreshed", f"Found {len(ports)} port(s)")
-    
-    def connect_hc05(self):
-        com = self.com_var.get()
-        if not com:
-            messagebox.showwarning("Select COM", "Please select a COM port")
-            return
-        try:
-            # Try different baud rates
-            baud_rates = [9600, 38400, 115200]
-            connected = False
-            
-            for baud in baud_rates:
-                try:
-                    print(f"Trying to connect at {baud} baud...")
-                    self.ser = serial.Serial(
-                        port=com, 
-                        baudrate=baud, 
-                        timeout=2,
-                        bytesize=serial.EIGHTBITS,
-                        parity=serial.PARITY_NONE,
-                        stopbits=serial.STOPBITS_ONE
-                    )
-                    time.sleep(2)
-                    self.ser.reset_input_buffer()
-                    self.ser.reset_output_buffer()
-                    print(f"Connected successfully at {baud} baud!")
-                    connected = True
-                    break
-                except:
-                    if self.ser and self.ser.is_open:
-                        self.ser.close()
-                    continue
-            
-            if not connected:
-                raise Exception("Could not connect at any baud rate (tried 9600, 38400, 115200)")
-            
-            self.is_connected = True
-            self.status_dot.itemconfig(self.dot_id, fill='#4CAF50')
-            self.status_label.config(text=f"Connected to {com}", fg='#4CAF50')
-            self.connect_btn.config(state=tk.DISABLED)
-            self.disconnect_btn.config(state=tk.NORMAL)
-            self.com_box.config(state=tk.DISABLED)
-            self.received_label.config(text="✅ Connected! Listening for gestures...")
-            threading.Thread(target=self.read_from_hc05, daemon=True).start()
-        except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed to connect:\n{str(e)}")
-    
-    def disconnect_hc05(self):
-        self.is_connected = False
-        if self.ser and self.ser.is_open:
-            try: self.ser.close()
-            except: pass
-        self.status_dot.itemconfig(self.dot_id, fill='#F44336')
-        self.status_label.config(text="Not Connected", fg='#F44336')
-        self.connect_btn.config(state=tk.NORMAL)
-        self.disconnect_btn.config(state=tk.DISABLED)
-        self.com_box.config(state='readonly')
-        self.received_label.config(text="Waiting for data...")
-    
-    def reset_stats(self):
-        self.gesture_count = {"LEFT": 0, "CENTER": 0, "RIGHT": 0, "NONE": 0}
-        self.total_gestures = 0
-        self.update_stats()
-        messagebox.showinfo("Reset", "Statistics have been reset!")
-    
-    def update_stats(self):
-        for gesture, count in self.gesture_count.items():
-            self.count_labels[gesture].config(text=str(count))
-        self.total_label.config(text=str(self.total_gestures))
-    
-    def read_from_hc05(self):
-        print("Starting to read from HC-05...")
-        while self.is_connected:
-            try:
-                if self.ser and self.ser.is_open and self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                    print(f"Received: '{line}'")  # Debug print
-                    
-                    if line:
-                        # Extract gesture from [BT: GESTURE] format
-                        gesture = None
-                        if "[BT:" in line:
-                            # Extract text between [BT: and ]
-                            start = line.find("[BT:") + 4
-                            end = line.find("]", start)
-                            if start > 3 and end > start:
-                                gesture = line[start:end].strip().upper()
-                                print(f"Extracted gesture: '{gesture}'")
-                        else:
-                            # Try direct gesture name
-                            gesture = line.upper()
-                        
-                        # Update received label with timestamp
-                        timestamp = time.strftime("%H:%M:%S")
-                        self.root.after(0, lambda l=line: self.received_label.config(
-                            text=f"📨 {l[:30]}... at {timestamp}" if len(l) > 30 else f"📨 {l} at {timestamp}"
-                        ))
-                        
-                        # Check if it's a valid gesture
-                        if gesture in ["LEFT", "CENTER", "RIGHT", "NONE"]:
-                            print(f"✅ Valid gesture: {gesture} - Moving hand!")
-                            # Update visualizer - ANIMATE THE HAND!
-                            self.root.after(0, lambda g=gesture: self.visualizer.show_gesture(g))
-                            
-                            # Update statistics
-                            self.gesture_count[gesture] += 1
-                            self.total_gestures += 1
-                            self.root.after(0, self.update_stats)
-                        else:
-                            print(f"❌ Invalid gesture: {gesture}")
-            except Exception as e:
-                print(f"Read error: {e}")
-            time.sleep(0.05)  # Fast polling for responsive detection
+        self._stop = threading.Event()
+        self._thread = None
 
-def main():
-    root = tk.Tk()
-    app = HC05App(root)
-    root.mainloop()
+    def connect(self, port, baud=9600):
+        if not HAS_PYSERIAL:
+            raise RuntimeError("pyserial not available")
+        self.ser = serial.Serial(port=port, baudrate=baud, timeout=1)
+        time.sleep(1.2)
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+        return True
+
+    def disconnect(self):
+        self._stop.set()
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
+    def is_connected(self):
+        return self.ser is not None and self.ser.is_open
+
+    def read_loop(self, callback):
+        self._stop.clear()
+        def _read():
+            while not self._stop.is_set() and self.is_connected():
+                try:
+                    if self.ser.in_waiting > 0:
+                        line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                        if line:
+                            callback(line)
+                    else:
+                        time.sleep(0.02)
+                except Exception as e:
+                    print("Serial read error:", e)
+                    time.sleep(0.1)
+        self._thread = threading.Thread(target=_read, daemon=True)
+        self._thread.start()
+
+if ANDROID_BLUETOOTH_AVAILABLE:
+    # Android classic Bluetooth SPP backend
+    from jnius import autoclass, cast
+    UUID = autoclass('java.util.UUID')
+
+    class AndroidBluetoothBackend(BluetoothBackendBase):
+        def __init__(self):
+            self.adapter = autoclass('android.bluetooth.BluetoothAdapter').getDefaultAdapter()
+            self.socket = None
+            self._stop = threading.Event()
+            self._thread = None
+
+        def connect(self, mac_address, uuid_str="00001101-0000-1000-8000-00805F9B34FB"):
+            if not self.adapter:
+                raise RuntimeError("No Bluetooth adapter")
+            remote = self.adapter.getRemoteDevice(mac_address)
+            uuid = UUID.fromString(uuid_str)
+            # createRfcommSocketToServiceRecord
+            try:
+                self.socket = remote.createRfcommSocketToServiceRecord(uuid)
+                activity = autoclass('org.kivy.android.PythonActivity').mActivity
+                self.socket.connect()
+                # getInputStream
+                self.input_stream = self.socket.getInputStream()
+            except Exception as e:
+                raise RuntimeError(f"Android Bluetooth connect failed: {e}")
+            return True
+
+        def disconnect(self):
+            self._stop.set()
+            try:
+                if self.socket:
+                    self.socket.close()
+            except Exception:
+                pass
+
+        def is_connected(self):
+            return self.socket is not None
+
+        def read_loop(self, callback):
+            self._stop.clear()
+            def _read():
+                buf = bytearray()
+                while not self._stop.is_set() and self.is_connected():
+                    try:
+                        # read available bytes (blocking small read)
+                        if self.input_stream.available() > 0:
+                            b = self.input_stream.read()
+                            if b == -1:
+                                time.sleep(0.05)
+                                continue
+                            if b == 10 or b == 13:
+                                if buf:
+                                    line = bytes(buf).decode('utf-8', errors='ignore').strip()
+                                    buf.clear()
+                                    if line:
+                                        callback(line)
+                            else:
+                                buf.append(b)
+                        else:
+                            time.sleep(0.02)
+                    except Exception as e:
+                        print("Android read error:", e)
+                        time.sleep(0.1)
+            self._thread = threading.Thread(target=_read, daemon=True)
+            self._thread.start()
+
+else:
+    AndroidBluetoothBackend = None
+
+# --- GUI Root ---
+class MainRoot(BoxLayout):
+    # UI state properties
+    conn_status = StringProperty("Not Connected")
+    conn_color = (1, 0.27, 0.27, 1)
+    connect_text = StringProperty("🔌 Connect")
+    port_list = []
+    port_text = StringProperty("Select port")
+    hand_emoji = StringProperty("✋")
+    hand_color = (0.8,0.8,0.8,1)
+    gesture_text = StringProperty("Waiting for gesture...")
+    ind_left = BooleanProperty(False)
+    ind_center = BooleanProperty(True)
+    ind_right = BooleanProperty(False)
+    count_left = NumericProperty(0)
+    count_right = NumericProperty(0)
+    count_center = NumericProperty(0)
+    count_none = NumericProperty(0)
+    last_received = StringProperty("No data yet")
+    mode_text = StringProperty("Auto / Mock")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.backend = None
+        self.reading = False
+        self.total = 0
+        self._detect_mode()  # sets mode_text and backend availability
+        Clock.schedule_once(lambda dt: self.refresh_ports(), 0.2)
+
+    def _detect_mode(self):
+        if platform == "android" and ANDROID_BLUETOOTH_AVAILABLE:
+            self.mode_text = "Android Bluetooth (pyjnius)"
+        elif HAS_PYSERIAL:
+            self.mode_text = "Desktop Serial (pyserial)"
+        else:
+            self.mode_text = "Mock (no Bluetooth available)"
+
+    def refresh_ports(self):
+        if HAS_PYSERIAL:
+            ports = list(serial.tools.list_ports.comports())
+            self.port_list = [p.device for p in ports]
+            self.port_text = self.port_list[0] if self.port_list else "No ports"
+        else:
+            self.port_list = []
+            self.port_text = "No serial"
+
+    def toggle_connect(self):
+        if self.reading:
+            self.disconnect()
+        else:
+            self.connect()
+
+    def connect(self):
+        # Decide backend based on environment
+        try:
+            if platform == "android" and ANDROID_BLUETOOTH_AVAILABLE:
+                # On Android we expect user to provide MAC in spinner or use a known address
+                backend = AndroidBluetoothBackend()
+                # For ease, spinner holds MAC or we fallback to mock
+                mac = self.port_text if self.port_text and ":" in self.port_text else None
+                if not mac:
+                    # If no mac provided, enter mock mode
+                    self._start_mock_reader()
+                    return
+                backend.connect(mac)
+                self.backend = backend
+            elif HAS_PYSERIAL:
+                backend = SerialBackend()
+                port = self.port_text if self.port_text and self.port_text != "No ports" else None
+                if not port:
+                    self._start_mock_reader()
+                    return
+                # try common baud rates as in original
+                for baud in (9600, 38400, 115200):
+                    try:
+                        backend.connect(port, baud=baud)
+                        break
+                    except Exception:
+                        continue
+                if not backend.is_connected():
+                    raise RuntimeError("Could not open serial")
+                self.backend = backend
+            else:
+                # no bluetooth/serial available -> mock
+                self._start_mock_reader()
+                return
+
+            # success - update UI
+            self.conn_status = f"Connected to {self.port_text}"
+            self.conn_color = (0.24,0.69,0.33,1)
+            self.connect_text = "⏸️ Disconnect"
+            self.reading = True
+            # start read loop
+            self.backend.read_loop(self._on_line_received)
+        except Exception as e:
+            self.conn_status = f"Error: {e}"
+            self.conn_color = (1,0.27,0.27,1)
+            print("Connect error:", e)
+
+    def disconnect(self):
+        try:
+            if self.backend:
+                self.backend.disconnect()
+            self.reading = False
+            self.backend = None
+        except Exception as e:
+            print("Disconnect error:", e)
+        self.conn_status = "Not Connected"
+        self.conn_color = (1,0.27,0.27,1)
+        self.connect_text = "🔌 Connect"
+
+    def _start_mock_reader(self):
+        # Useful for testing UI on desktop without hardware
+        self.conn_status = "Mock mode (no physical device)"
+        self.conn_color = (0.9,0.6,0.2,1)
+        self.connect_text = "⏸️ Stop Mock"
+        self.reading = True
+        def mock_loop():
+            choices = ["[BT: LEFT]", "[BT: RIGHT]", "[BT: CENTER]", "[BT: NONE]"]
+            while self.reading:
+                line = choices[int(time.time()) % 4]
+                self._on_line_received(line)
+                time.sleep(1.0)
+        t = threading.Thread(target=mock_loop, daemon=True)
+        t.start()
+
+    def reset_stats(self):
+        self.count_left = self.count_right = self.count_center = self.count_none = 0
+        self.total = 0
+
+    @mainthread
+    def _update_last(self, line):
+        now = time.strftime("%H:%M:%S")
+        short = (line[:30] + '...') if len(line) > 30 else line
+        self.last_received = f"{short} at {now}"
+
+    def _on_line_received(self, line):
+        # Called from background thread
+        print("Received:", line)
+        # parse like original: [BT: GESTURE]
+        gesture = None
+        if "[BT:" in line:
+            start = line.find("[BT:") + 4
+            end = line.find("]", start)
+            if start > 3 and end > start:
+                gesture = line[start:end].strip().upper()
+        else:
+            gesture = line.strip().upper()
+
+        # update last label
+        Clock.schedule_once(lambda dt, l=line: self._update_last(l), 0)
+
+        if gesture in ("LEFT", "RIGHT", "CENTER", "NONE"):
+            # schedule UI animation
+            Clock.schedule_once(lambda dt, g=gesture: self.show_gesture(g), 0)
+            # update counts
+            if gesture == "LEFT":
+                self.count_left += 1
+            elif gesture == "RIGHT":
+                self.count_right += 1
+            elif gesture == "CENTER":
+                self.count_center += 1
+            elif gesture == "NONE":
+                self.count_none += 1
+            self.total += 1
+        else:
+            print("Invalid gesture:", gesture)
+
+    def show_gesture(self, gesture):
+        # animations for hand label: move to left/center/right and change emoji/color/text
+        hand = self.ids.get('hand_label')
+        gt = self.ids.get('gesture_text')
+        if not hand or not gt:
+            return
+
+        w = self.width
+        center_x = self.width / 2
+        y = hand.center_y
+
+        config = {
+            "LEFT": {"x": self.x + 100, "emoji": "👈", "color": (0.2,0.6,1,1), "text": "◀️ LEFT DETECTED"},
+            "CENTER": {"x": center_x, "emoji": "✋", "color": (0.2,1,0.4,1), "text": "✋ CENTER DETECTED"},
+            "RIGHT": {"x": self.right - 100, "emoji": "👉", "color": (1,0.4,0.6,1), "text": "▶️ RIGHT DETECTED"},
+            "NONE": {"x": center_x, "emoji": "🚫", "color": (0.6,0.6,0.6,1), "text": "⭕ NO GESTURE"}
+        }
+
+        c = config.get(gesture, config["NONE"])
+
+        # update indicator booleans
+        self.ind_left = (gesture == "LEFT")
+        self.ind_center = (gesture == "CENTER" or gesture == "NONE")
+        self.ind_right = (gesture == "RIGHT")
+
+        # animate position & pulse
+        Animation.cancel_all(hand)
+        anim = Animation(center_x=c["x"], d=0.25, t='out_quad')
+        anim &= Animation(font_size='140sp' if gesture != "NONE" else '120sp', d=0.12)
+        anim.start(hand)
+
+        # pulse effect after move
+        def pulse(*args):
+            Animation.cancel_all(hand)
+            a = Animation(font_size='160sp', d=0.12) + Animation(font_size='120sp', d=0.12)
+            a.start(hand)
+        Clock.schedule_once(pulse, 0.28)
+
+        # set emoji & colors & text
+        self.hand_emoji = c["emoji"]
+        self.hand_color = c["color"]
+        self.gesture_text = c["text"]
+
+class GestureApp(App):
+    def build(self):
+        Window.clearcolor = (0.06,0.13,0.38,1)
+        Builder.load_string(KV)
+        return MainRoot()
 
 if __name__ == "__main__":
-    main()
+    GestureApp().run()
